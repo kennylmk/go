@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Front Resource Stack
+Parameters:
+  SecretsManagerSecretId:
+    Type: String
+    Default: go-react-aws
+  DeployTimestamp:
+    Type: String
+    Default: 0
+  AppDomain:
+    Type: String
+    Default: go-react-aws
+  SetupDomainAndCert:
+    Type: String
+    Default: false
+    AllowedValues:
+      - true
+      - false
+  FrontWebBucketName:
+    Description: Bucket name for web frontend. It will be genarated by CFn if not specified.
+    Type: String
+    Default: 'null'
+  FrontResourcesBucketName:
+    Description: Bucket name for resources. It will be genarated by CFn if not specified.
+    Type: String
+    Default: 'null'
+  AcmCertificateArn:
+    Description: ARN of a certificate
+    Type: String
+
+Conditions:
+  # ConditionSetupDomainAndCert: !Equals [ !Ref SetupDomainAndCert, true ]
+  UseSpecifiedWebBucketName:
+    Fn::Not: [!Equals [!Ref FrontWebBucketName, 'null']]
+  UseSpecifiedResourcesBucketName:
+    Fn::Not: [!Equals [!Ref FrontResourcesBucketName, 'null']]
+
+Resources:
+  FrontWebBucket:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: 
+        Fn::If:
+          - UseSpecifiedWebBucketName
+          - !Ref FrontWebBucketName
+          - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: 'AES256'
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "${SecretsManagerSecretId}-logs"
+        LogFilePrefix: "FrontWebBucket/FrontWebBucket"
+
+  FrontResourcesBucket:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Metadata:
+      DeployTimestamp: !Ref DeployTimestamp
+    Properties:
+      BucketName:
+        Fn::If:
+          - UseSpecifiedResourcesBucketName
+          - !Ref FrontResourcesBucketName
+          - !Ref AWS::NoValue
+      CorsConfiguration:
+        CorsRules:
+          - Id: 'allowAll'
+            AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedHeaders:
+              - '*'
+      LifecycleConfiguration:
+        Rules:
+          - Id: remove_old_survey_results_csv
+            Prefix: public/resources/survey_results/
+            ExpirationInDays: 1
+            Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: 'AES256'
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "${SecretsManagerSecretId}-logs"
+        LogFilePrefix: "FrontResourcesBucket/FrontResourcesBucket"
+
+  FrontWebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontWebBucket
+      PolicyDocument:
+        Statement:
+          - Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub
+              - "${FrontWebBucketArn}/*"
+              - FrontWebBucketArn: !GetAtt FrontWebBucket.Arn
+            Principal:
+              AWS: !Sub
+                - arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${OriginAccessIdentityId}
+                - OriginAccessIdentityId:
+                    Fn::ImportValue: !Sub ${SecretsManagerSecretId}-CloudFrontIdentityID
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'true'
+
+  FrontResourcesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontResourcesBucket
+      PolicyDocument:
+        Statement:
+          - Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub
+              - "${ResourcesBucketArn}/*"
+              - ResourcesBucketArn: !GetAtt FrontResourcesBucket.Arn
+            Principal:
+              AWS: !Sub
+                - arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${OriginAccessIdentityId}
+                - OriginAccessIdentityId:
+                    Fn::ImportValue: !Sub ${SecretsManagerSecretId}-CloudFrontIdentityID
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'true'
+
+  FrontWebCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: 'S3-resources-bucket'
+            DomainName: !GetAtt FrontResourcesBucket.RegionalDomainName
+            OriginPath: "/public"
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub
+                - origin-access-identity/cloudfront/${OriginAccessIdentityId}
+                - OriginAccessIdentityId:
+                    Fn::ImportValue: !Sub ${SecretsManagerSecretId}-CloudFrontIdentityID
+          - Id: 'S3-web-bucket'
+            DomainName: !GetAtt FrontWebBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub
+                - origin-access-identity/cloudfront/${OriginAccessIdentityId}
+                - OriginAccessIdentityId:
+                    Fn::ImportValue: !Sub ${SecretsManagerSecretId}-CloudFrontIdentityID
+        Enabled: true
+        HttpVersion: http2
+        DefaultRootObject: index.html
+        Comment: !Sub ${AWS::StackName} distribution
+        CacheBehaviors:
+          - PathPattern: "resources/*"
+            TargetOriginId: 'S3-resources-bucket'
+            ForwardedValues:
+              QueryString: false
+            ViewerProtocolPolicy: redirect-to-https
+        DefaultCacheBehavior:
+          TargetOriginId: 'S3-web-bucket'
+          ForwardedValues:
+            QueryString: false
+          ViewerProtocolPolicy: redirect-to-https
+        CustomErrorResponses:
+          - ErrorCode: 400
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        Aliases:
+          Fn::If:
+            - ConditionSetupDomainAndCert
+            - - !Ref AppDomain
+            - !Ref AWS::NoValue
+        ViewerCertificate:
+          Fn::If:
+            - ConditionSetupDomainAndCert
+            - AcmCertificateArn: !Ref AcmCertificateArn
+              MinimumProtocolVersion: TLSv1.2_2018
+              SslSupportMethod: sni-only
+            - !Ref AWS::NoValue
+
+  AdminWebResourceRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ConditionSetupDomainAndCert
+    Properties:
+      Comment: !Sub "[${SecretsManagerSecretId}] admin-web resources domain name"
+      HostedZoneId: !Sub '{{resolve:secretsmanager:${SecretsManagerSecretId}:SecretString:DNS_DOMAIN_LIFF_HOSTED_ZONE_ID}}'
+      Name: !Sub "${AppDomain}."
+      Type: CNAME
+      TTL: 300
+      ResourceRecords:
+        - !GetAtt FrontWebCloudFront.DomainName
+
+  # TableAdminDatabase:
+  #   Type: AWS::DynamoDB::Table
+  #   UpdateReplacePolicy: Retain
+  #   DeletionPolicy: Retain
+  #   Properties:
+  #     BillingMode: PAY_PER_REQUEST
+  #     AttributeDefinitions:
+  #       - AttributeName: partitionKey
+  #         AttributeType: S
+  #     KeySchema:
+  #       - AttributeName: partitionKey
+  #         KeyType: HASH
+  #     Tags:
+  #       - 
+  #         Key: "backup"
+  #         Value: "dynamoDB"
+
+  # # TablePlatformLogs
+  # TablePlatformLogs:
+  #   Type: AWS::DynamoDB::Table
+  #   DeletionPolicy: Retain
+  #   UpdateReplacePolicy: Retain
+  #   Properties:
+  #     BillingMode: PAY_PER_REQUEST
+  #     AttributeDefinitions:
+  #       - AttributeName: logType
+  #         AttributeType: S
+  #       - AttributeName: createdAt
+  #         AttributeType: N
+  #     KeySchema:
+  #       - AttributeName: logType
+  #         KeyType: HASH
+  #       - AttributeName: createdAt
+  #         KeyType: RANGE
+  #     GlobalSecondaryIndexes:
+  #       - IndexName: logType-createdAt-index
+  #         KeySchema:
+  #           - AttributeName: logType
+  #             KeyType: HASH
+  #           - AttributeName: createdAt
+  #             KeyType: RANGE
+  #         Projection:
+  #           ProjectionType: ALL
+  #     Tags:
+  #       - 
+  #         Key: "backup"
+  #         Value: "dynamoDB"
+
+Outputs:
+  CloudFrontURL:
+    Value:
+      Fn::Join:
+        - ''
+        - - 'https://'
+          - !If [ConditionSetupDomainAndCert, !Ref AppDomain, !GetAtt FrontWebCloudFront.DomainName]
+  CloudFrontDistributionId:
+    Description: AWS_CLOUDFRONT_DISTRIBUTION_ID
+    Value: !Ref FrontWebCloudFront
+  # TableAdminDatabase:
+  #   Description: TableAdminDatabase
+  #   Value: !Ref TableAdminDatabase
+  #   Export:
+  #     Name: !Sub "${SecretsManagerSecretId}-TableAdminDatabase"
+  # TablePlatformLogs:
+  #   Description: TablePlatformLogs
+  #   Value: !Ref TablePlatformLogs
+  #   Export:
+  #     Name: !Sub "${SecretsManagerSecretId}-TablePlatformLogs"
+  FrontWebBucket:
+    Description: the bucket for web app
+    Value: !Ref FrontWebBucket
+    Export:
+      Name: !Sub "${SecretsManagerSecretId}-FrontWebBucket"
+  FrontResourcesBucket:
+    Description: the bucket for uploaded resources
+    Value: !Ref FrontResourcesBucket
+    Export:
+      Name: !Sub "${SecretsManagerSecretId}-FrontResourcesBucket"
