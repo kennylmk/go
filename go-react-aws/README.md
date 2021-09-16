@@ -13,6 +13,10 @@ https://nodejs.org/en/download/
 ## Install Amplify CLI
 `npm i -g @aws-amplify/cli`
 
+## Install aws Amplify
+`npm install aws-amplify --save`
+`npm install aws-amplify-react --save`
+
 ## Configure Amplify
 `amplify configure`
 
